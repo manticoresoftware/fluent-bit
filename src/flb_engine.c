@@ -1503,8 +1503,8 @@ int flb_engine_start(struct flb_config *config)
                     else {
                         flb_info("[engine] service has stopped (%i pending tasks)",
                                  tasks);
-                        ret = config->exit_status_code;
                         flb_engine_shutdown(config);
+                        ret = config->exit_status_code;
 
                         if (config->shutdown_fd > 0) {
                             mk_event_timeout_destroy(config->evl,
