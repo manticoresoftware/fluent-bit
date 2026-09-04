@@ -29,7 +29,10 @@
 
 #include <msgpack.h>
 
+#include <inttypes.h>
+#include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "manticore.h"
@@ -38,9 +41,54 @@
 #define MANTICORE_STREAM_RETRY          1
 #define MANTICORE_STREAM_RECORD_ERROR   2
 
+struct manticore_id_list {
+    uint64_t *values;
+    size_t count;
+    size_t capacity;
+};
+
 static int append(flb_sds_t *buf, const char *data, size_t len)
 {
     return flb_sds_cat_safe(buf, data, len);
+}
+
+static int is_query_component_char(unsigned char c)
+{
+    return (c >= 'a' && c <= 'z') ||
+           (c >= 'A' && c <= 'Z') ||
+           (c >= '0' && c <= '9') ||
+           c == '-' || c == '_' || c == '.' || c == '~';
+}
+
+static flb_sds_t build_bulk_uri(const char *table)
+{
+    int ret;
+    size_t i;
+    char encoded[4];
+    flb_sds_t uri;
+
+    uri = flb_sds_create(FLB_MANTICORE_BULK_URI);
+    if (uri == NULL) {
+        return NULL;
+    }
+
+    for (i = 0; table[i] != '\0'; i++) {
+        if (is_query_component_char((unsigned char) table[i])) {
+            ret = append(&uri, &table[i], 1);
+        }
+        else {
+            snprintf(encoded, sizeof(encoded), "%%%02X",
+                     (unsigned char) table[i]);
+            ret = append(&uri, encoded, 3);
+        }
+
+        if (ret != 0) {
+            flb_sds_destroy(uri);
+            return NULL;
+        }
+    }
+
+    return uri;
 }
 
 static char *object_to_json(const msgpack_object *obj, int escape_unicode)
@@ -64,10 +112,81 @@ static int key_equals(const msgpack_object *key, const char *name)
     return memcmp(key->via.str.ptr, name, len) == 0;
 }
 
+static int parse_id(const msgpack_object *value, uint64_t *id)
+{
+    size_t i;
+    uint64_t current;
+    unsigned int digit;
+
+    if (value->type == MSGPACK_OBJECT_POSITIVE_INTEGER) {
+        if (value->via.u64 == 0) {
+            return -1;
+        }
+        *id = value->via.u64;
+        return 0;
+    }
+
+    if (value->type != MSGPACK_OBJECT_STR || value->via.str.size == 0) {
+        return -1;
+    }
+
+    current = 0;
+    for (i = 0; i < value->via.str.size; i++) {
+        if (value->via.str.ptr[i] < '0' || value->via.str.ptr[i] > '9') {
+            return -1;
+        }
+        digit = value->via.str.ptr[i] - '0';
+        if (current > (UINT64_MAX - digit) / 10) {
+            return -1;
+        }
+        current = current * 10 + digit;
+    }
+
+    if (current == 0) {
+        return -1;
+    }
+    *id = current;
+    return 0;
+}
+
+static int append_id(struct manticore_id_list *ids, uint64_t id)
+{
+    size_t capacity;
+    uint64_t *values;
+
+    if (ids->count == ids->capacity) {
+        capacity = ids->capacity == 0 ? 64 : ids->capacity * 2;
+        if (capacity < ids->capacity ||
+            capacity > SIZE_MAX / sizeof(uint64_t)) {
+            return -1;
+        }
+        values = flb_realloc(ids->values, capacity * sizeof(uint64_t));
+        if (values == NULL) {
+            return -1;
+        }
+        ids->values = values;
+        ids->capacity = capacity;
+    }
+
+    ids->values[ids->count++] = id;
+    return 0;
+}
+
+static int compare_ids(const void *left, const void *right)
+{
+    uint64_t a;
+    uint64_t b;
+
+    a = *(const uint64_t *) left;
+    b = *(const uint64_t *) right;
+    return (a > b) - (a < b);
+}
+
 static int validate_record(struct flb_out_manticore *ctx,
-                           const msgpack_object *body)
+                           const msgpack_object *body, uint64_t *id)
 {
     int i;
+    int id_found;
     const msgpack_object_kv *entry;
 
     if (body == NULL || body->type != MSGPACK_OBJECT_MAP) {
@@ -76,6 +195,7 @@ static int validate_record(struct flb_out_manticore *ctx,
     }
 
     entry = body->via.map.ptr;
+    id_found = FLB_FALSE;
     for (i = 0; i < body->via.map.size; i++) {
         if (entry[i].key.type != MSGPACK_OBJECT_STR) {
             flb_plg_error(ctx->ins, "record keys must be strings");
@@ -86,14 +206,20 @@ static int validate_record(struct flb_out_manticore *ctx,
             continue;
         }
 
-        if (entry[i].val.type != MSGPACK_OBJECT_POSITIVE_INTEGER &&
-            entry[i].val.type != MSGPACK_OBJECT_NEGATIVE_INTEGER &&
-            entry[i].val.type != MSGPACK_OBJECT_STR) {
+        if (id_found || parse_id(&entry[i].val, id) != 0) {
             flb_plg_error(ctx->ins,
-                          "record key '%s' must be an integer or string",
+                          "record key '%s' must be a unique, non-zero numeric ID",
                           ctx->id_key);
             return -1;
         }
+        id_found = FLB_TRUE;
+    }
+
+    if (!id_found) {
+        flb_plg_error(ctx->ins,
+                      "record key '%s' must contain a non-zero numeric ID",
+                      ctx->id_key);
+        return -1;
     }
 
     return 0;
@@ -103,8 +229,11 @@ static int validate_events(struct flb_out_manticore *ctx,
                            const void *data, size_t bytes)
 {
     int ret;
+    size_t i;
+    uint64_t id;
     struct flb_log_event event;
     struct flb_log_event_decoder decoder;
+    struct manticore_id_list ids = {0};
 
     ret = flb_log_event_decoder_init(&decoder, (char *) data, bytes);
     if (ret != FLB_EVENT_DECODER_SUCCESS) {
@@ -115,9 +244,16 @@ static int validate_events(struct flb_out_manticore *ctx,
 
     while (flb_log_event_decoder_next(&decoder, &event) ==
            FLB_EVENT_DECODER_SUCCESS) {
-        if (validate_record(ctx, event.body) != 0) {
+        if (validate_record(ctx, event.body, &id) != 0) {
+            flb_free(ids.values);
             flb_log_event_decoder_destroy(&decoder);
             return MANTICORE_STREAM_RECORD_ERROR;
+        }
+        if (append_id(&ids, id) != 0) {
+            flb_plg_error(ctx->ins, "could not allocate document ID preflight");
+            flb_free(ids.values);
+            flb_log_event_decoder_destroy(&decoder);
+            return MANTICORE_STREAM_RETRY;
         }
     }
 
@@ -126,7 +262,24 @@ static int validate_events(struct flb_out_manticore *ctx,
         flb_plg_error(ctx->ins, "could not decode log event: %s",
                       flb_log_event_decoder_get_error_description(ret));
     }
+    else if (ids.count == 0) {
+        flb_plg_error(ctx->ins, "bulk_import requires at least one record");
+        ret = MANTICORE_STREAM_RECORD_ERROR;
+    }
+    else if (ids.count > 1) {
+        qsort(ids.values, ids.count, sizeof(uint64_t), compare_ids);
+        for (i = 1; i < ids.count; i++) {
+            if (ids.values[i - 1] == ids.values[i]) {
+                flb_plg_error(ctx->ins,
+                              "record key '%s' must be unique within a chunk",
+                              ctx->id_key);
+                ret = MANTICORE_STREAM_RECORD_ERROR;
+                break;
+            }
+        }
+    }
 
+    flb_free(ids.values);
     flb_log_event_decoder_destroy(&decoder);
     return ret == FLB_EVENT_DECODER_SUCCESS ?
            MANTICORE_STREAM_OK : MANTICORE_STREAM_RECORD_ERROR;
@@ -137,10 +290,12 @@ static flb_sds_t format_record(struct flb_out_manticore *ctx,
 {
     int ret;
     int i;
+    int id_len;
     int fields;
+    uint64_t numeric_id;
+    char id_json[32];
     char *key_json;
     char *value_json;
-    char *id_json;
     flb_sds_t out;
     const msgpack_object *id;
     const msgpack_object_kv *entry;
@@ -162,25 +317,16 @@ static flb_sds_t format_record(struct flb_out_manticore *ctx,
         }
     }
 
-    id_json = NULL;
-    if (id != NULL) {
-        if (id->type != MSGPACK_OBJECT_POSITIVE_INTEGER &&
-            id->type != MSGPACK_OBJECT_NEGATIVE_INTEGER &&
-            id->type != MSGPACK_OBJECT_STR) {
-            flb_plg_error(ctx->ins, "record key '%s' must be an integer or string",
-                          ctx->id_key);
-            return NULL;
-        }
-
-        id_json = object_to_json(id, ctx->config->json_escape_unicode);
-        if (id_json == NULL) {
-            return NULL;
-        }
+    if (id == NULL || parse_id(id, &numeric_id) != 0) {
+        return NULL;
+    }
+    id_len = snprintf(id_json, sizeof(id_json), "%" PRIu64, numeric_id);
+    if (id_len <= 0 || id_len >= sizeof(id_json)) {
+        return NULL;
     }
 
     out = flb_sds_create_size(512);
     if (out == NULL) {
-        flb_free(id_json);
         return NULL;
     }
 
@@ -188,14 +334,9 @@ static flb_sds_t format_record(struct flb_out_manticore *ctx,
     ret |= append(&out, ctx->bulk_action, strlen(ctx->bulk_action));
     ret |= append(&out, "\":{\"table\":", sizeof("\":{\"table\":") - 1);
     ret |= append(&out, ctx->table_json, flb_sds_len(ctx->table_json));
-
-    if (id_json != NULL) {
-        ret |= append(&out, ",\"id\":", sizeof(",\"id\":") - 1);
-        ret |= append(&out, id_json, strlen(id_json));
-    }
-
+    ret |= append(&out, ",\"id\":", sizeof(",\"id\":") - 1);
+    ret |= append(&out, id_json, id_len);
     ret |= append(&out, ",\"doc\":{", sizeof(",\"doc\":{") - 1);
-    flb_free(id_json);
 
     fields = 0;
     for (i = 0; i < body->via.map.size; i++) {
@@ -273,7 +414,8 @@ static int write_chunk(struct flb_connection *connection,
     return 0;
 }
 
-static int item_status_is_retryable(const msgpack_object *item)
+static void inspect_item_status(const msgpack_object *item,
+                                int *has_status, int *retryable)
 {
     int i;
     msgpack_object action;
@@ -281,12 +423,12 @@ static int item_status_is_retryable(const msgpack_object *item)
     msgpack_object value;
 
     if (item->type != MSGPACK_OBJECT_MAP || item->via.map.size != 1) {
-        return FLB_FALSE;
+        return;
     }
 
     action = item->via.map.ptr[0].val;
     if (action.type != MSGPACK_OBJECT_MAP) {
-        return FLB_FALSE;
+        return;
     }
 
     for (i = 0; i < action.via.map.size; i++) {
@@ -298,29 +440,28 @@ static int item_status_is_retryable(const msgpack_object *item)
         }
 
         if (value.type == MSGPACK_OBJECT_POSITIVE_INTEGER) {
-            return value.via.u64 == 408 || value.via.u64 == 429 ||
-                   value.via.u64 >= 500;
+            *has_status = FLB_TRUE;
+            if (value.via.u64 == 408 || value.via.u64 == 429 ||
+                value.via.u64 >= 500) {
+                *retryable = FLB_TRUE;
+            }
+            return;
         }
     }
-
-    return FLB_FALSE;
 }
 
-static int response_has_retryable_item(const msgpack_object *items)
+static void inspect_response_items(const msgpack_object *items,
+                                   int *has_status, int *retryable)
 {
     int i;
 
     if (items->type != MSGPACK_OBJECT_ARRAY) {
-        return FLB_FALSE;
+        return;
     }
 
     for (i = 0; i < items->via.array.size; i++) {
-        if (item_status_is_retryable(&items->via.array.ptr[i])) {
-            return FLB_TRUE;
-        }
+        inspect_item_status(&items->via.array.ptr[i], has_status, retryable);
     }
-
-    return FLB_FALSE;
 }
 
 static int response_ok(struct flb_out_manticore *ctx,
@@ -330,6 +471,7 @@ static int response_ok(struct flb_out_manticore *ctx,
     int ret;
     int root_type;
     int errors;
+    int has_status;
     int retryable;
     char *packed;
     size_t packed_size;
@@ -339,11 +481,12 @@ static int response_ok(struct flb_out_manticore *ctx,
     msgpack_object value;
     msgpack_unpacked result;
 
-    if (client->resp.status >= 200 && client->resp.status < 300) {
-        packed = NULL;
-        packed_size = 0;
-        errors = -1;
-        retryable = FLB_FALSE;
+    packed = NULL;
+    packed_size = 0;
+    errors = -1;
+    has_status = FLB_FALSE;
+    retryable = FLB_FALSE;
+    if (client->resp.payload_size > 0) {
         ret = flb_pack_json(client->resp.payload, client->resp.payload_size,
                             &packed, &packed_size, &root_type, NULL);
         if (ret == 0) {
@@ -365,7 +508,7 @@ static int response_ok(struct flb_out_manticore *ctx,
                         else if (key.type == MSGPACK_OBJECT_STR &&
                                  key.via.str.size == 5 &&
                                  memcmp(key.via.str.ptr, "items", 5) == 0) {
-                            retryable = response_has_retryable_item(&value);
+                            inspect_response_items(&value, &has_status, &retryable);
                         }
                     }
                 }
@@ -373,7 +516,9 @@ static int response_ok(struct flb_out_manticore *ctx,
             msgpack_unpacked_destroy(&result);
         }
         flb_free(packed);
+    }
 
+    if (client->resp.status >= 200 && client->resp.status < 300) {
         if (errors == FLB_FALSE) {
             return FLB_OK;
         }
@@ -401,8 +546,12 @@ static int response_ok(struct flb_out_manticore *ctx,
                       client->resp.status);
     }
 
-    if (client->resp.status == 408 || client->resp.status == 429 ||
-        client->resp.status >= 500) {
+    if (retryable == FLB_TRUE || client->resp.status == 408 ||
+        client->resp.status == 429) {
+        return FLB_RETRY;
+    }
+
+    if (client->resp.status >= 500 && has_status == FLB_FALSE) {
         return FLB_RETRY;
     }
 
@@ -432,11 +581,6 @@ static int stream_events(struct flb_out_manticore *ctx,
 
     while ((ret = flb_log_event_decoder_next(&decoder, &event)) ==
            FLB_EVENT_DECODER_SUCCESS) {
-        if (validate_record(ctx, event.body) != 0) {
-            ret = MANTICORE_STREAM_RECORD_ERROR;
-            break;
-        }
-
         line = format_record(ctx, event.body);
         if (line == NULL) {
             ret = MANTICORE_STREAM_RETRY;
@@ -513,7 +657,7 @@ static int send_stream(struct flb_out_manticore *ctx,
     }
 
     client = flb_http_client(connection, FLB_HTTP_POST,
-                             FLB_MANTICORE_DEFAULT_URI,
+                             ctx->bulk_uri,
                              NULL, 0, NULL, 0, NULL, 0);
     if (client == NULL) {
         flb_upstream_conn_release(connection);
@@ -521,10 +665,12 @@ static int send_stream(struct flb_out_manticore *ctx,
     }
 
     flb_http_remove_header(client, "Content-Length", 14);
+    flb_http_remove_header(client, "Connection", 10);
     client->body_len = -1;
     flb_http_add_header(client, "Content-Type", 12,
                         "application/x-ndjson", 20);
     flb_http_add_header(client, "Transfer-Encoding", 17, "chunked", 7);
+    flb_http_add_header(client, "Connection", 10, "close", 5);
     flb_http_add_header(client, "User-Agent", 10,
                         "Fluent-Bit-Manticore", 20);
     flb_http_buffer_size(client, ctx->buffer_size);
@@ -542,13 +688,11 @@ static int send_stream(struct flb_out_manticore *ctx,
 
     ret = stream_events(ctx, connection, data, bytes);
     if (ret != MANTICORE_STREAM_OK) {
-        flb_upstream_conn_recycle(connection, FLB_FALSE);
         result = ret == MANTICORE_STREAM_RECORD_ERROR ? FLB_ERROR : FLB_RETRY;
         goto done;
     }
 
     if (write_all(connection, "0\r\n\r\n", 5) != 0) {
-        flb_upstream_conn_recycle(connection, FLB_FALSE);
         result = FLB_RETRY;
         goto done;
     }
@@ -562,13 +706,11 @@ static int send_stream(struct flb_out_manticore *ctx,
         goto done;
     }
 
-    if (client->resp.connection_close == FLB_TRUE) {
-        flb_upstream_conn_recycle(connection, FLB_FALSE);
-    }
-
     result = response_ok(ctx, client);
 
 done:
+    /* Closing the session releases Manticore's bulk_import reservation. */
+    flb_upstream_conn_recycle(connection, FLB_FALSE);
     flb_http_client_destroy(client);
     flb_upstream_conn_release(connection);
     return result;
@@ -602,14 +744,14 @@ static int cb_manticore_init(struct flb_output_instance *ins,
     }
 
     if (strcasecmp(ctx->action, "insert") != 0 &&
-        strcasecmp(ctx->action, "replace") != 0) {
-        flb_plg_error(ins, "action must be 'insert' or 'replace'");
+        strcasecmp(ctx->action, "create") != 0) {
+        flb_plg_error(ins, "action must be 'insert' or 'create'");
         flb_free(ctx);
         return -1;
     }
 
-    ctx->bulk_action = strcasecmp(ctx->action, "replace") == 0 ?
-                       "replace" : "insert";
+    ctx->bulk_action = strcasecmp(ctx->action, "create") == 0 ?
+                       "create" : "insert";
 
     if (ctx->stream_chunk_size == 0) {
         flb_plg_error(ins, "stream_chunk_size must be greater than zero");
@@ -632,6 +774,16 @@ static int cb_manticore_init(struct flb_output_instance *ins,
         return -1;
     }
 
+    ctx->bulk_uri = build_bulk_uri(ctx->table);
+    if (ctx->bulk_uri == NULL) {
+        flb_sds_destroy(ctx->table_json);
+        flb_free(ctx);
+        return -1;
+    }
+
+    /* A persistent session would keep the bulk_import reservation active. */
+    ins->net_setup.keepalive = FLB_FALSE;
+
     io_flags = ins->use_tls == FLB_TRUE ? FLB_IO_TLS : FLB_IO_TCP;
     if (ins->host.ipv6 == FLB_TRUE) {
         io_flags |= FLB_IO_IPV6;
@@ -640,6 +792,7 @@ static int cb_manticore_init(struct flb_output_instance *ins,
     ctx->u = flb_upstream_create(config, ins->host.name, ins->host.port,
                                  io_flags, ins->tls);
     if (ctx->u == NULL) {
+        flb_sds_destroy(ctx->bulk_uri);
         flb_sds_destroy(ctx->table_json);
         flb_free(ctx);
         return -1;
@@ -683,6 +836,9 @@ static int cb_manticore_exit(void *data, struct flb_config *config)
     if (ctx->table_json != NULL) {
         flb_sds_destroy(ctx->table_json);
     }
+    if (ctx->bulk_uri != NULL) {
+        flb_sds_destroy(ctx->bulk_uri);
+    }
     flb_free(ctx);
     return 0;
 }
@@ -694,14 +850,14 @@ static struct flb_config_map config_map[] = {
      "Target Manticore table (must already exist)"
     },
     {
-     FLB_CONFIG_MAP_STR, "action", "replace",
+     FLB_CONFIG_MAP_STR, "action", "insert",
      0, FLB_TRUE, offsetof(struct flb_out_manticore, action),
-     "Manticore /bulk action: insert or replace"
+     "Manticore bulk import action: insert or create"
     },
     {
      FLB_CONFIG_MAP_STR, "id_key", "id",
      0, FLB_TRUE, offsetof(struct flb_out_manticore, id_key),
-     "Top-level record key used as the document id and removed from doc"
+     "Required top-level non-zero numeric document ID, removed from doc"
     },
     {
      FLB_CONFIG_MAP_SIZE, "stream_chunk_size", "64K",

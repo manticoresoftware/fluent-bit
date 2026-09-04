@@ -1,13 +1,13 @@
 # Manticore Search output
 
-The `manticore` output sends log records to the native Manticore Search
-[`/bulk`](https://manual.manticoresearch.com/Data_creation_and_modification/Adding_documents_to_a_table/Adding_documents_to_a_real-time_table#Chunked-transfer-in-/bulk)
-endpoint as newline-delimited JSON over HTTP/1.1 chunked transfer encoding.
+The `manticore` output sends log records to Manticore Search's direct-to-disk
+bulk import endpoint, `/bulk?bulk_import=<table>`, as newline-delimited JSON
+over HTTP/1.1 chunked transfer encoding.
 
 The plugin formats each Fluent Bit record as one Manticore operation:
 
 ```json
-{"replace":{"table":"logs","id":42,"doc":{"message":"hello","status":200}}}
+{"insert":{"table":"logs","id":42,"doc":{"message":"hello","status":200}}}
 ```
 
 It converts records incrementally and buffers at most `stream_chunk_size` bytes
@@ -19,10 +19,18 @@ chunk. The plugin never builds the complete NDJSON request body in memory.
 The target table must exist before Fluent Bit sends data. Manticore's native
 `/bulk` endpoint does not create tables automatically.
 
-For retry-safe delivery, every record should contain a stable ID in `id_key` and
-the default `replace` action should be used. If a record has no such key,
-Manticore generates an ID; replaying that record after a network failure can
-then create a duplicate.
+Each request is imported directly into one disk chunk and published at request
+EOF. The `table` option is sent both in `bulk_import=<table>` and in every
+operation. Empty NDJSON lines are never generated, so one Fluent Bit flush is
+published as one batch. The plugin closes the HTTP connection after each flush
+to release Manticore's bulk import reservation and unblock ordinary writes.
+For this reason, `net.keepalive` is disabled for this output.
+
+Every record must contain a stable, non-zero numeric ID in `id_key`. Decimal
+strings are accepted and normalized to JSON numbers. Missing, zero, negative,
+non-decimal, overflowing, or duplicate IDs are rejected during preflight before
+the HTTP connection is opened. Preflight retains one 64-bit ID per record to
+verify uniqueness; it does not buffer the encoded NDJSON body.
 
 ## Configuration
 
@@ -33,7 +41,7 @@ then create a duplicate.
     Host               manticore
     Port               9308
     Table              logs
-    Action             replace
+    Action             insert
     Id_Key             id
     Stream_Chunk_Size  64K
 ```
@@ -50,8 +58,8 @@ HTTP Basic authentication is available through `HTTP_User` and `HTTP_Passwd`.
 | Option | Description | Default |
 |---|---|---|
 | `table` | Existing target Manticore table. Required. | none |
-| `action` | Native `/bulk` action: `insert` or `replace`. | `replace` |
-| `id_key` | Top-level record key moved to the operation's `id`; it is removed from `doc`. | `id` |
+| `action` | Direct-to-disk `/bulk` action: `insert` or `create`. | `insert` |
+| `id_key` | Required top-level non-zero numeric ID, moved to `id` and removed from `doc`. | `id` |
 | `stream_chunk_size` | Maximum NDJSON bytes buffered before an HTTP chunk is written. A single larger record is sent separately. | `64K` |
 | `buffer_size` | Maximum buffer used to read the Manticore response. | `64K` |
 | `http_user` | HTTP Basic authentication user. | none |
@@ -60,14 +68,17 @@ HTTP Basic authentication is available through `HTTP_User` and `HTTP_Passwd`.
 ## Response and retry behavior
 
 - HTTP `2xx` with `"errors": false`: the Fluent Bit chunk is acknowledged.
-- HTTP `2xx` with `"errors": true` and any item status `408`, `429`, or
-  `5xx`: Fluent Bit retries the whole chunk.
-- HTTP `408`, `429`, or `5xx`, and transport failures: Fluent Bit retries the
-  whole chunk.
-- Other HTTP `4xx`, or HTTP `2xx` with only permanent item errors: the chunk
-  is rejected as a permanent error.
+- A response with `"errors": true` and any item status `408`, `429`, or `5xx`:
+  Fluent Bit retries the whole chunk.
+- HTTP `408` or `429`, transport failures, and HTTP `5xx` without a readable
+  item status: Fluent Bit retries the whole chunk.
+- A response with only permanent item statuses is rejected permanently, even
+  when Manticore reports the request itself as HTTP `5xx`. Other HTTP `4xx`
+  responses are also permanent.
 
-A mixed `/bulk` response can contain successful and transiently failed items.
-Fluent Bit can only retry its original chunk, so successful items are replayed.
-Stable IDs plus the default `replace` action make that replay idempotent. Using
-`insert` trades that safety for strict insert semantics.
+A mixed `/bulk` response can contain successful and transiently failed batches.
+Fluent Bit can only retry its original chunk, so successful batches are
+replayed. Bulk import publication replaces rows with matching IDs already in
+the table, making replay safe when every record has a stable ID. Within one
+batch, duplicate numeric IDs are invalid; the plugin rejects them before
+delivery.
