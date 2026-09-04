@@ -19,7 +19,10 @@
 
 #include <fluent-bit/flb_output_plugin.h>
 #include <fluent-bit/flb_output.h>
+#include <fluent-bit/flb_storage.h>
+#include <fluent-bit/flb_task.h>
 #include <fluent-bit/flb_http_client.h>
+#include <fluent-bit/flb_info.h>
 #include <fluent-bit/flb_io.h>
 #include <fluent-bit/flb_log_event_decoder.h>
 #include <fluent-bit/flb_mem.h>
@@ -29,11 +32,19 @@
 
 #include <msgpack.h>
 
+#include <errno.h>
 #include <inttypes.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifndef FLB_SYSTEM_WINDOWS
+#include <fcntl.h>
+#include <sys/file.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 #include "manticore.h"
 
@@ -226,7 +237,8 @@ static int validate_record(struct flb_out_manticore *ctx,
 }
 
 static int validate_events(struct flb_out_manticore *ctx,
-                           const void *data, size_t bytes)
+                           const void *data, size_t bytes,
+                           struct manticore_id_list *collected_ids)
 {
     int ret;
     size_t i;
@@ -279,10 +291,19 @@ static int validate_events(struct flb_out_manticore *ctx,
         }
     }
 
-    flb_free(ids.values);
     flb_log_event_decoder_destroy(&decoder);
-    return ret == FLB_EVENT_DECODER_SUCCESS ?
-           MANTICORE_STREAM_OK : MANTICORE_STREAM_RECORD_ERROR;
+    if (ret != FLB_EVENT_DECODER_SUCCESS) {
+        flb_free(ids.values);
+        return MANTICORE_STREAM_RECORD_ERROR;
+    }
+
+    if (collected_ids != NULL) {
+        *collected_ids = ids;
+    }
+    else {
+        flb_free(ids.values);
+    }
+    return MANTICORE_STREAM_OK;
 }
 
 static flb_sds_t format_record(struct flb_out_manticore *ctx,
@@ -636,6 +657,357 @@ static int stream_events(struct flb_out_manticore *ctx,
     return ret;
 }
 
+#ifndef FLB_SYSTEM_WINDOWS
+static size_t session_id_slot(uint64_t id, size_t capacity)
+{
+    id ^= id >> 33;
+    id *= UINT64_C(0xff51afd7ed558ccd);
+    id ^= id >> 33;
+    id *= UINT64_C(0xc4ceb9fe1a85ec53);
+    id ^= id >> 33;
+    return (size_t) id & (capacity - 1);
+}
+
+static int session_id_contains(struct flb_out_manticore *ctx, uint64_t id)
+{
+    size_t slot;
+
+    if (ctx->session_id_capacity == 0) {
+        return FLB_FALSE;
+    }
+    slot = session_id_slot(id, ctx->session_id_capacity);
+    while (ctx->session_ids[slot] != 0) {
+        if (ctx->session_ids[slot] == id) {
+            return FLB_TRUE;
+        }
+        slot = (slot + 1) & (ctx->session_id_capacity - 1);
+    }
+    return FLB_FALSE;
+}
+
+static void session_id_insert(struct flb_out_manticore *ctx, uint64_t id)
+{
+    size_t slot;
+
+    slot = session_id_slot(id, ctx->session_id_capacity);
+    while (ctx->session_ids[slot] != 0) {
+        slot = (slot + 1) & (ctx->session_id_capacity - 1);
+    }
+    ctx->session_ids[slot] = id;
+    ctx->session_id_count++;
+}
+
+static int prepare_session_ids(struct flb_out_manticore *ctx,
+                               struct manticore_id_list *incoming)
+{
+    size_t i;
+    size_t required;
+    size_t capacity;
+    uint64_t *old_ids;
+    uint64_t *new_ids;
+    size_t old_capacity;
+
+    if (incoming->count > SIZE_MAX - ctx->session_id_count) {
+        return -1;
+    }
+    required = incoming->count + ctx->session_id_count;
+    if (required > ctx->max_session_ids) {
+        flb_plg_error(ctx->ins,
+                      "single-chunk session exceeds max_session_ids (%zu)",
+                      ctx->max_session_ids);
+        return MANTICORE_STREAM_RECORD_ERROR;
+    }
+    capacity = ctx->session_id_capacity == 0 ? 128 : ctx->session_id_capacity;
+    while (required > capacity / 2) {
+        if (capacity > SIZE_MAX / 2) {
+            return -1;
+        }
+        capacity *= 2;
+    }
+    if (capacity > SIZE_MAX / sizeof(uint64_t)) {
+        return -1;
+    }
+
+    for (i = 0; i < incoming->count; i++) {
+        if (session_id_contains(ctx, incoming->values[i])) {
+            flb_plg_error(ctx->ins,
+                          "record key '%s' must be unique within a session",
+                          ctx->id_key);
+            return MANTICORE_STREAM_RECORD_ERROR;
+        }
+    }
+
+    if (capacity != ctx->session_id_capacity) {
+        new_ids = flb_calloc(capacity, sizeof(uint64_t));
+        if (new_ids == NULL) {
+            return -1;
+        }
+        old_ids = ctx->session_ids;
+        old_capacity = ctx->session_id_capacity;
+        ctx->session_ids = new_ids;
+        ctx->session_id_capacity = capacity;
+        ctx->session_id_count = 0;
+        for (i = 0; i < old_capacity; i++) {
+            if (old_ids[i] != 0) {
+                session_id_insert(ctx, old_ids[i]);
+            }
+        }
+        flb_free(old_ids);
+    }
+    return MANTICORE_STREAM_OK;
+}
+
+static int rollback_spool(struct flb_out_manticore *ctx, off_t offset)
+{
+    int failed;
+
+    failed = FLB_FALSE;
+    clearerr(ctx->spool);
+    if (fflush(ctx->spool) != 0) {
+        failed = FLB_TRUE;
+    }
+    if (ftruncate(ctx->spool_fd, offset) != 0) {
+        failed = FLB_TRUE;
+    }
+    if (fseeko(ctx->spool, offset, SEEK_SET) != 0) {
+        failed = FLB_TRUE;
+    }
+    if (failed == FLB_TRUE) {
+        flb_plg_error(ctx->ins, "could not roll back spool '%s'",
+                      ctx->spool_path);
+        return -1;
+    }
+    return 0;
+}
+
+static int rollback_commit(struct flb_out_manticore *ctx, off_t offset)
+{
+    int failed;
+
+    failed = FLB_FALSE;
+    clearerr(ctx->commit);
+    if (fflush(ctx->commit) != 0) {
+        failed = FLB_TRUE;
+    }
+    if (ftruncate(ctx->commit_fd, offset) != 0) {
+        failed = FLB_TRUE;
+    }
+    if (fseeko(ctx->commit, offset, SEEK_SET) != 0) {
+        failed = FLB_TRUE;
+    }
+    if (failed == FLB_TRUE) {
+        flb_plg_error(ctx->ins, "could not roll back commit journal '%s'",
+                      ctx->commit_path);
+        return -1;
+    }
+    return 0;
+}
+
+static uint64_t hash_bytes(uint64_t hash, const void *data, size_t length)
+{
+    size_t i;
+    const unsigned char *bytes;
+
+    bytes = data;
+    for (i = 0; i < length; i++) {
+        hash ^= bytes[i];
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+static uint64_t session_fingerprint(struct flb_out_manticore *ctx)
+{
+    uint64_t hash;
+
+    hash = UINT64_C(1469598103934665603);
+    hash = hash_bytes(hash, ctx->ins->host.name, strlen(ctx->ins->host.name));
+    hash = hash_bytes(hash, &ctx->ins->host.port, sizeof(ctx->ins->host.port));
+    hash = hash_bytes(hash, ctx->table, strlen(ctx->table));
+    hash = hash_bytes(hash, ctx->bulk_action, strlen(ctx->bulk_action));
+    hash = hash_bytes(hash, ctx->id_key, strlen(ctx->id_key));
+    hash = hash_bytes(hash, &ctx->ins->use_tls, sizeof(ctx->ins->use_tls));
+    if (ctx->http_user != NULL) {
+        hash = hash_bytes(hash, ctx->http_user, strlen(ctx->http_user));
+    }
+    return hash;
+}
+
+static int hash_file_range(int fd, off_t start, off_t end, uint64_t *result)
+{
+    ssize_t length;
+    off_t offset;
+    uint64_t hash;
+    char *buffer;
+
+    buffer = flb_malloc(65536);
+    if (buffer == NULL) {
+        return -1;
+    }
+    hash = UINT64_C(1469598103934665603);
+    offset = start;
+    while (offset < end) {
+        size_t requested;
+
+        requested = (size_t) (end - offset);
+        if (requested > 65536) {
+            requested = 65536;
+        }
+        length = pread(fd, buffer, requested, offset);
+        if (length <= 0) {
+            flb_free(buffer);
+            return -1;
+        }
+        hash = hash_bytes(hash, buffer, (size_t) length);
+        offset += length;
+    }
+    flb_free(buffer);
+    *result = hash;
+    return 0;
+}
+
+static int commit_spool_offset(struct flb_out_manticore *ctx, off_t start,
+                               off_t offset,
+                               off_t *journal_offset)
+{
+    uint64_t checksum;
+    uint64_t value;
+
+    if (offset < 0) {
+        return -1;
+    }
+    *journal_offset = ftello(ctx->commit);
+    if (*journal_offset < 0) {
+        return -1;
+    }
+    value = (uint64_t) offset;
+    if (hash_file_range(ctx->spool_fd, start, offset, &checksum) != 0 ||
+        fprintf(ctx->commit,
+                "%016" PRIx64 " %016" PRIx64 " %016" PRIx64 "\n",
+                value, ~value, checksum) != 51 ||
+        fflush(ctx->commit) != 0 || fsync(ctx->commit_fd) != 0) {
+        if (rollback_commit(ctx, *journal_offset) != 0) {
+            return -2;
+        }
+        return -1;
+    }
+    return 0;
+}
+
+static int spool_events(struct flb_out_manticore *ctx,
+                        const void *data, size_t bytes)
+{
+    int ret;
+    off_t offset;
+    off_t journal_offset;
+    off_t committed_offset;
+    int commit_result;
+
+    flb_sds_t line;
+    struct flb_log_event event;
+    struct flb_log_event_decoder decoder;
+    struct manticore_id_list ids = {0};
+
+    ret = validate_events(ctx, data, bytes, &ids);
+    if (ret != MANTICORE_STREAM_OK) {
+        return ret == MANTICORE_STREAM_RETRY ? FLB_RETRY : FLB_ERROR;
+    }
+
+    ret = prepare_session_ids(ctx, &ids);
+    if (ret != MANTICORE_STREAM_OK) {
+        flb_free(ids.values);
+        return ret == MANTICORE_STREAM_RECORD_ERROR ? FLB_ERROR : FLB_RETRY;
+    }
+
+    offset = ftello(ctx->spool);
+    if (offset < 0 ||
+        flb_log_event_decoder_init(&decoder, (char *) data, bytes) !=
+        FLB_EVENT_DECODER_SUCCESS) {
+        flb_free(ids.values);
+        return FLB_RETRY;
+    }
+
+    ret = FLB_OK;
+    while (flb_log_event_decoder_next(&decoder, &event) ==
+           FLB_EVENT_DECODER_SUCCESS) {
+        line = format_record(ctx, event.body);
+        if (line == NULL) {
+            ret = FLB_RETRY;
+            break;
+        }
+        if (fwrite(line, 1, flb_sds_len(line), ctx->spool) !=
+            flb_sds_len(line)) {
+            flb_sds_destroy(line);
+            ret = FLB_RETRY;
+            break;
+        }
+        flb_sds_destroy(line);
+    }
+    flb_log_event_decoder_destroy(&decoder);
+
+    if (ret == FLB_OK) {
+        committed_offset = ftello(ctx->spool);
+        commit_result = 0;
+        if (committed_offset < 0 || fflush(ctx->spool) != 0 ||
+            fsync(ctx->spool_fd) != 0) {
+            ret = FLB_RETRY;
+        }
+        else {
+            commit_result = commit_spool_offset(ctx, offset, committed_offset,
+                                                &journal_offset);
+            if (commit_result != 0) {
+                ret = commit_result == -2 ? FLB_ERROR : FLB_RETRY;
+            }
+        }
+    }
+    if (ret != FLB_OK) {
+        if (rollback_spool(ctx, offset) != 0) {
+            ret = FLB_ERROR;
+        }
+    }
+    else {
+        size_t i;
+
+        for (i = 0; i < ids.count; i++) {
+            session_id_insert(ctx, ids.values[i]);
+        }
+    }
+    flb_free(ids.values);
+    return ret;
+}
+
+static int stream_spool(struct flb_out_manticore *ctx,
+                        struct flb_connection *connection)
+{
+    size_t length;
+    char *buffer;
+
+    buffer = flb_malloc(ctx->stream_chunk_size);
+    if (buffer == NULL) {
+        return -1;
+    }
+    if (fflush(ctx->spool) != 0 || fseeko(ctx->spool, 0, SEEK_SET) != 0) {
+        flb_free(buffer);
+        return -1;
+    }
+
+    while ((length = fread(buffer, 1, ctx->stream_chunk_size,
+                           ctx->spool)) > 0) {
+        if (write_chunk(connection, buffer, length) != 0) {
+            flb_free(buffer);
+            return -1;
+        }
+    }
+    if (ferror(ctx->spool)) {
+        clearerr(ctx->spool);
+        flb_free(buffer);
+        return -1;
+    }
+    flb_free(buffer);
+    return 0;
+}
+#endif
+
 static int send_stream(struct flb_out_manticore *ctx,
                        const void *data, size_t bytes)
 {
@@ -646,7 +1018,7 @@ static int send_stream(struct flb_out_manticore *ctx,
     struct flb_http_client *client;
 
     /* A permanent record error must not follow already transmitted records. */
-    ret = validate_events(ctx, data, bytes);
+    ret = validate_events(ctx, data, bytes, NULL);
     if (ret != MANTICORE_STREAM_OK) {
         return ret == MANTICORE_STREAM_RETRY ? FLB_RETRY : FLB_ERROR;
     }
@@ -716,6 +1088,422 @@ done:
     return result;
 }
 
+#ifndef FLB_SYSTEM_WINDOWS
+static int send_spool(struct flb_out_manticore *ctx)
+{
+    int ret;
+    int result;
+    size_t sent;
+    struct flb_connection *connection;
+    struct flb_http_client *client;
+
+    connection = flb_upstream_conn_get(ctx->u);
+    if (connection == NULL) {
+        return FLB_RETRY;
+    }
+
+    client = flb_http_client(connection, FLB_HTTP_POST, ctx->bulk_uri,
+                             NULL, 0, NULL, 0, NULL, 0);
+    if (client == NULL) {
+        flb_upstream_conn_release(connection);
+        return FLB_RETRY;
+    }
+
+    flb_http_remove_header(client, "Content-Length", 14);
+    flb_http_remove_header(client, "Connection", 10);
+    client->body_len = -1;
+    flb_http_add_header(client, "Content-Type", 12,
+                        "application/x-ndjson", 20);
+    flb_http_add_header(client, "Transfer-Encoding", 17, "chunked", 7);
+    flb_http_add_header(client, "Connection", 10, "close", 5);
+    flb_http_add_header(client, "User-Agent", 10,
+                        "Fluent-Bit-Manticore", 20);
+    flb_http_buffer_size(client, ctx->buffer_size);
+    if (ctx->http_user != NULL) {
+        flb_http_basic_auth(client, ctx->http_user, ctx->http_passwd);
+    }
+
+    sent = 0;
+    ret = flb_http_do_request(client, &sent);
+    if (ret != FLB_HTTP_MORE || stream_spool(ctx, connection) != 0 ||
+        write_all(connection, "0\r\n\r\n", 5) != 0) {
+        result = FLB_RETRY;
+        goto done;
+    }
+
+    do {
+        ret = flb_http_get_response_data(client, 0);
+    } while (ret == FLB_HTTP_MORE || ret == FLB_HTTP_CHUNK_AVAILABLE);
+    result = ret == FLB_HTTP_OK ? response_ok(ctx, client) : FLB_RETRY;
+
+done:
+    flb_upstream_conn_recycle(connection, FLB_FALSE);
+    flb_http_client_destroy(client);
+    flb_upstream_conn_release(connection);
+    return result;
+}
+
+static int recover_spool(struct flb_out_manticore *ctx)
+{
+    int consumed;
+    off_t data_size;
+    off_t good_end;
+    off_t current;
+    uint64_t checksum;
+    uint64_t expected_checksum;
+    uint64_t fingerprint;
+    uint64_t fingerprint_inverse;
+    uint64_t value;
+    uint64_t inverse;
+    char boundary;
+    char line[128];
+    struct stat status;
+
+    if (fstat(ctx->spool_fd, &status) != 0 || status.st_size < 0) {
+        return -1;
+    }
+    data_size = status.st_size;
+    current = 0;
+    good_end = 0;
+    clearerr(ctx->commit);
+    if (fseeko(ctx->commit, 0, SEEK_SET) != 0) {
+        return -1;
+    }
+
+    if (fgets(line, sizeof(line), ctx->commit) == NULL) {
+        if (ferror(ctx->commit) || data_size != 0) {
+            return -1;
+        }
+        fingerprint = session_fingerprint(ctx);
+        if (fprintf(ctx->commit,
+                    "MANTICORE1 %016" PRIx64 " %016" PRIx64 "\n",
+                    fingerprint, ~fingerprint) != 45 ||
+            fflush(ctx->commit) != 0 || fsync(ctx->commit_fd) != 0) {
+            return -1;
+        }
+        return 0;
+    }
+    consumed = 0;
+    if (sscanf(line, "MANTICORE1 %16" SCNx64 " %16" SCNx64 "%n",
+               &fingerprint, &fingerprint_inverse, &consumed) != 2 ||
+        consumed != 44 || line[consumed] != '\n' ||
+        line[consumed + 1] != '\0' ||
+        fingerprint_inverse != ~fingerprint ||
+        fingerprint != session_fingerprint(ctx)) {
+        flb_plg_error(ctx->ins,
+                      "commit journal '%s' does not match this output configuration",
+                      ctx->commit_path);
+        return -1;
+    }
+    good_end = ftello(ctx->commit);
+    if (good_end < 0) {
+        return -1;
+    }
+
+    /* A successful upload can crash after the spool was truncated but before
+     * its journal was cleared. The upload is already acknowledged by the
+     * server, so validate complete journal records and reset the empty pair.
+     */
+    if (data_size == 0) {
+        while (fgets(line, sizeof(line), ctx->commit) != NULL) {
+            if (strchr(line, '\n') == NULL) {
+                if (!feof(ctx->commit)) {
+                    flb_plg_error(ctx->ins, "commit journal '%s' is corrupt",
+                                  ctx->commit_path);
+                    return -1;
+                }
+                break;
+            }
+            consumed = 0;
+            if (sscanf(line,
+                       "%16" SCNx64 " %16" SCNx64 " %16" SCNx64 "%n",
+                       &value, &inverse, &expected_checksum, &consumed) != 3 ||
+                consumed != 50 || line[consumed] != '\n' ||
+                line[consumed + 1] != '\0' || inverse != ~value ||
+                value == 0) {
+                flb_plg_error(ctx->ins, "commit journal '%s' is corrupt",
+                              ctx->commit_path);
+                return -1;
+            }
+            good_end = ftello(ctx->commit);
+            if (good_end < 0) {
+                return -1;
+            }
+        }
+        if (ferror(ctx->commit)) {
+            return -1;
+        }
+        clearerr(ctx->commit);
+        if (ftruncate(ctx->commit_fd, 0) != 0 ||
+            fsync(ctx->commit_fd) != 0 ||
+            fseeko(ctx->commit, 0, SEEK_SET) != 0 ||
+            fprintf(ctx->commit,
+                    "MANTICORE1 %016" PRIx64 " %016" PRIx64 "\n",
+                    fingerprint, ~fingerprint) != 45 ||
+            fflush(ctx->commit) != 0 || fsync(ctx->commit_fd) != 0) {
+            return -1;
+        }
+        return 0;
+    }
+
+    while (fgets(line, sizeof(line), ctx->commit) != NULL) {
+        if (strchr(line, '\n') == NULL) {
+            if (!feof(ctx->commit)) {
+                flb_plg_error(ctx->ins, "commit journal '%s' is corrupt",
+                              ctx->commit_path);
+                return -1;
+            }
+            break;
+        }
+        consumed = 0;
+        if (sscanf(line,
+                   "%16" SCNx64 " %16" SCNx64 " %16" SCNx64 "%n",
+                   &value, &inverse, &expected_checksum, &consumed) != 3 ||
+            consumed != 50 || line[consumed] != '\n' ||
+            line[consumed + 1] != '\0' || inverse != ~value ||
+            value <= (uint64_t) current || value > (uint64_t) data_size ||
+            hash_file_range(ctx->spool_fd, current, (off_t) value,
+                            &checksum) != 0 || checksum != expected_checksum ||
+            pread(ctx->spool_fd, &boundary, 1, (off_t) value - 1) != 1 ||
+            boundary != '\n') {
+            flb_plg_error(ctx->ins, "commit journal or spool '%s' is corrupt",
+                          ctx->spool_path);
+            return -1;
+        }
+        current = (off_t) value;
+        good_end = ftello(ctx->commit);
+        if (good_end < 0) {
+            return -1;
+        }
+    }
+    if (ferror(ctx->commit)) {
+        return -1;
+    }
+
+    clearerr(ctx->commit);
+    if (ftruncate(ctx->commit_fd, good_end) != 0 ||
+        fsync(ctx->commit_fd) != 0 ||
+        fseeko(ctx->commit, 0, SEEK_END) != 0) {
+        return -1;
+    }
+    if (ftruncate(ctx->spool_fd, current) != 0 ||
+        fsync(ctx->spool_fd) != 0 ||
+        fseeko(ctx->spool, current, SEEK_SET) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static int sync_parent_directory(const char *path)
+{
+    int fd;
+    int ret;
+    char *copy;
+    char *separator;
+
+    copy = flb_strdup(path);
+    if (copy == NULL) {
+        return -1;
+    }
+    separator = strrchr(copy, '/');
+    if (separator == NULL) {
+        flb_free(copy);
+        copy = flb_strdup(".");
+        if (copy == NULL) {
+            return -1;
+        }
+    }
+    else if (separator == copy) {
+        separator[1] = '\0';
+    }
+    else {
+        *separator = '\0';
+    }
+#ifdef O_DIRECTORY
+    fd = open(copy, O_RDONLY | O_DIRECTORY);
+#else
+    fd = open(copy, O_RDONLY);
+#endif
+    flb_free(copy);
+    if (fd < 0) {
+        return -1;
+    }
+    ret = fsync(fd);
+    close(fd);
+    return ret;
+}
+
+static int open_spool(struct flb_out_manticore *ctx)
+{
+    int flags;
+    struct stat status;
+
+    flags = O_CREAT | O_RDWR | O_APPEND;
+#ifdef O_CLOEXEC
+    flags |= O_CLOEXEC;
+#endif
+#ifdef O_NOFOLLOW
+    flags |= O_NOFOLLOW;
+#endif
+    ctx->spool_fd = open(ctx->spool_path, flags, S_IRUSR | S_IWUSR);
+    if (ctx->spool_fd < 0 || flock(ctx->spool_fd, LOCK_EX | LOCK_NB) != 0) {
+        flb_plg_error(ctx->ins, "could not exclusively open spool '%s'",
+                      ctx->spool_path);
+        if (ctx->spool_fd >= 0) {
+            close(ctx->spool_fd);
+            ctx->spool_fd = -1;
+        }
+        return -1;
+    }
+    if (fstat(ctx->spool_fd, &status) != 0 || !S_ISREG(status.st_mode)) {
+        flb_plg_error(ctx->ins, "spool '%s' must be a regular file",
+                      ctx->spool_path);
+        close(ctx->spool_fd);
+        ctx->spool_fd = -1;
+        return -1;
+    }
+    ctx->spool = fdopen(ctx->spool_fd, "a+");
+    if (ctx->spool == NULL) {
+        close(ctx->spool_fd);
+        ctx->spool_fd = -1;
+        return -1;
+    }
+
+    if (strlen(ctx->spool_path) > SIZE_MAX - 8) {
+        fclose(ctx->spool);
+        ctx->spool = NULL;
+        ctx->spool_fd = -1;
+        return -1;
+    }
+    ctx->commit_path = flb_sds_create_size(strlen(ctx->spool_path) + 8);
+    if (ctx->commit_path == NULL ||
+        flb_sds_printf(&ctx->commit_path, "%s.commit", ctx->spool_path) == NULL) {
+        flb_sds_destroy(ctx->commit_path);
+        ctx->commit_path = NULL;
+        fclose(ctx->spool);
+        ctx->spool = NULL;
+        ctx->spool_fd = -1;
+        return -1;
+    }
+    ctx->commit_fd = open(ctx->commit_path, flags, S_IRUSR | S_IWUSR);
+    if (ctx->commit_fd < 0 || fstat(ctx->commit_fd, &status) != 0 ||
+        !S_ISREG(status.st_mode)) {
+        flb_plg_error(ctx->ins, "could not open commit journal '%s'",
+                      ctx->commit_path);
+        if (ctx->commit_fd >= 0) {
+            close(ctx->commit_fd);
+        }
+        ctx->commit_fd = -1;
+        fclose(ctx->spool);
+        ctx->spool = NULL;
+        ctx->spool_fd = -1;
+        return -1;
+    }
+    ctx->commit = fdopen(ctx->commit_fd, "a+");
+    if (ctx->commit == NULL) {
+        close(ctx->commit_fd);
+        ctx->commit_fd = -1;
+        fclose(ctx->spool);
+        ctx->spool = NULL;
+        ctx->spool_fd = -1;
+        return -1;
+    }
+    if (recover_spool(ctx) != 0 ||
+        sync_parent_directory(ctx->spool_path) != 0) {
+        flb_plg_error(ctx->ins, "could not recover durable spool '%s'",
+                      ctx->spool_path);
+        fclose(ctx->commit);
+        ctx->commit = NULL;
+        ctx->commit_fd = -1;
+        fclose(ctx->spool);
+        ctx->spool = NULL;
+        ctx->spool_fd = -1;
+        return -1;
+    }
+    return 0;
+}
+
+static int clear_spool(struct flb_out_manticore *ctx)
+{
+    clearerr(ctx->spool);
+    if (fflush(ctx->spool) != 0 ||
+        ftruncate(ctx->spool_fd, 0) != 0 ||
+        fsync(ctx->spool_fd) != 0 ||
+        fseeko(ctx->spool, 0, SEEK_SET) != 0) {
+        flb_plg_error(ctx->ins, "could not clear spool '%s'",
+                      ctx->spool_path);
+        return -1;
+    }
+
+    /* Clear the journal last. If the process dies between these two phases,
+     * recovery sees an empty spool and can safely discard the old journal.
+     */
+    clearerr(ctx->commit);
+    if (fflush(ctx->commit) != 0 ||
+        ftruncate(ctx->commit_fd, 0) != 0 ||
+        fsync(ctx->commit_fd) != 0 ||
+        fseeko(ctx->commit, 0, SEEK_SET) != 0) {
+        flb_plg_error(ctx->ins, "could not clear commit journal '%s'",
+                      ctx->commit_path);
+        return -1;
+    }
+    return 0;
+}
+
+static void close_spool(struct flb_out_manticore *ctx)
+{
+    if (ctx->commit != NULL) {
+        fclose(ctx->commit);
+        ctx->commit = NULL;
+        ctx->commit_fd = -1;
+    }
+    if (ctx->spool != NULL) {
+        fclose(ctx->spool);
+        ctx->spool = NULL;
+        ctx->spool_fd = -1;
+    }
+}
+
+static int remove_owned_path(struct flb_out_manticore *ctx,
+                             const char *path, int fd, const char *kind)
+{
+    struct stat open_status;
+    struct stat path_status;
+
+    if (fstat(fd, &open_status) != 0 || lstat(path, &path_status) != 0 ||
+        open_status.st_dev != path_status.st_dev ||
+        open_status.st_ino != path_status.st_ino) {
+        flb_plg_warn(ctx->ins, "refusing to remove replaced %s '%s'", kind, path);
+        return -1;
+    }
+    if (unlink(path) != 0) {
+        flb_plg_warn(ctx->ins, "could not remove %s '%s'", kind, path);
+        return -1;
+    }
+    return 0;
+}
+
+static void remove_spool(struct flb_out_manticore *ctx, const char *reason)
+{
+    int failed;
+
+    failed = FLB_FALSE;
+    if (remove_owned_path(ctx, ctx->spool_path, ctx->spool_fd,
+                          reason) != 0) {
+        failed = FLB_TRUE;
+    }
+    if (ctx->commit_path != NULL &&
+        remove_owned_path(ctx, ctx->commit_path, ctx->commit_fd,
+                          "commit journal") != 0) {
+        failed = FLB_TRUE;
+    }
+    if (failed == FLB_FALSE && sync_parent_directory(ctx->spool_path) != 0) {
+        flb_plg_warn(ctx->ins, "could not sync spool directory for '%s'",
+                     ctx->spool_path);
+    }
+}
+#endif
+
 static int cb_manticore_init(struct flb_output_instance *ins,
                              struct flb_config *config, void *data)
 {
@@ -734,6 +1522,8 @@ static int cb_manticore_init(struct flb_output_instance *ins,
 
     ctx->ins = ins;
     ctx->config = config;
+    ctx->spool_fd = -1;
+    ctx->commit_fd = -1;
     flb_output_net_default("127.0.0.1", FLB_MANTICORE_DEFAULT_PORT, ins);
 
     ret = flb_output_config_map_set(ins, ctx);
@@ -753,8 +1543,33 @@ static int cb_manticore_init(struct flb_output_instance *ins,
     ctx->bulk_action = strcasecmp(ctx->action, "create") == 0 ?
                        "create" : "insert";
 
-    if (ctx->stream_chunk_size == 0) {
-        flb_plg_error(ins, "stream_chunk_size must be greater than zero");
+    if (ctx->single_chunk == FLB_TRUE) {
+#ifdef FLB_SYSTEM_WINDOWS
+        flb_plg_error(ins, "single_chunk is not supported on Windows");
+        flb_free(ctx);
+        return -1;
+#else
+        if (ins->tp_workers != 1) {
+            flb_plg_error(ins, "single_chunk requires exactly one output worker");
+            flb_free(ctx);
+            return -1;
+        }
+        if (ctx->spool_path == NULL || ctx->spool_path[0] == '\0') {
+            flb_plg_error(ins, "spool_path is required when single_chunk is enabled");
+            flb_free(ctx);
+            return -1;
+        }
+        if (strcasecmp(ctx->action, "insert") != 0) {
+            flb_plg_error(ins, "single_chunk requires action 'insert' for replay safety");
+            flb_free(ctx);
+            return -1;
+        }
+#endif
+    }
+
+    if (ctx->stream_chunk_size == 0 || ctx->max_session_ids == 0) {
+        flb_plg_error(ins,
+                      "stream_chunk_size and max_session_ids must be greater than zero");
         flb_free(ctx);
         return -1;
     }
@@ -798,6 +1613,46 @@ static int cb_manticore_init(struct flb_output_instance *ins,
         return -1;
     }
     flb_output_upstream_set(ctx->u, ins);
+
+#ifndef FLB_SYSTEM_WINDOWS
+    if (ctx->single_chunk == FLB_TRUE) {
+        off_t spool_size;
+
+        if (open_spool(ctx) != 0) {
+            flb_upstream_destroy(ctx->u);
+            flb_sds_destroy(ctx->bulk_uri);
+            flb_sds_destroy(ctx->table_json);
+            flb_sds_destroy(ctx->commit_path);
+            flb_free(ctx);
+            return -1;
+        }
+        spool_size = ftello(ctx->spool);
+        if (spool_size < 0) {
+            close_spool(ctx);
+            flb_upstream_destroy(ctx->u);
+            flb_sds_destroy(ctx->bulk_uri);
+            flb_sds_destroy(ctx->table_json);
+            flb_sds_destroy(ctx->commit_path);
+            flb_free(ctx);
+            return -1;
+        }
+        if (spool_size > 0) {
+            flb_plg_info(ins, "replaying pending single-chunk spool '%s'",
+                         ctx->spool_path);
+            if (send_spool(ctx) != FLB_OK || clear_spool(ctx) != 0) {
+                flb_plg_error(ins, "could not replay pending spool '%s'",
+                              ctx->spool_path);
+                close_spool(ctx);
+                flb_upstream_destroy(ctx->u);
+                flb_sds_destroy(ctx->bulk_uri);
+                flb_sds_destroy(ctx->table_json);
+                flb_sds_destroy(ctx->commit_path);
+                flb_free(ctx);
+                return -1;
+            }
+        }
+    }
+#endif
     flb_output_set_context(ins, ctx);
     flb_output_set_http_debug_callbacks(ins);
     return 0;
@@ -816,19 +1671,108 @@ static void cb_manticore_flush(struct flb_event_chunk *event_chunk,
     (void) config;
 
     ctx = out_context;
-    ret = send_stream(ctx, event_chunk->data, event_chunk->size);
+    if (ctx->single_chunk == FLB_TRUE) {
+#ifndef FLB_SYSTEM_WINDOWS
+        if (ctx->session_failed == FLB_TRUE) {
+            ret = FLB_ERROR;
+        }
+        else {
+            ret = spool_events(ctx, event_chunk->data, event_chunk->size);
+            if (ret == FLB_ERROR) {
+                ctx->session_failed = FLB_TRUE;
+                if (clear_spool(ctx) != 0) {
+                    flb_plg_error(ctx->ins,
+                                  "could not durably abort single-chunk session");
+                }
+            }
+        }
+#else
+        ret = FLB_ERROR;
+#endif
+    }
+    else {
+        ret = send_stream(ctx, event_chunk->data, event_chunk->size);
+    }
     FLB_OUTPUT_RETURN(ret);
 }
 
 static int cb_manticore_exit(void *data, struct flb_config *config)
 {
+    int fs_chunks;
+    int mem_chunks;
+    int tasks;
+    int ret;
     struct flb_out_manticore *ctx;
 
-    (void) config;
     ctx = data;
     if (ctx == NULL) {
         return 0;
     }
+
+#ifndef FLB_SYSTEM_WINDOWS
+    if (ctx->single_chunk == FLB_TRUE && ctx->spool != NULL) {
+        off_t spool_size;
+
+        if (ctx->session_failed == FLB_TRUE) {
+            flb_plg_error(ctx->ins,
+                          "single-chunk session aborted after a permanent record error");
+            config->exit_status_code = 1;
+            ret = FLB_ERROR;
+        }
+        else if ((tasks = flb_task_running_count(config)) > 0) {
+            flb_plg_error(ctx->ins,
+                          "single-chunk session is incomplete (%d running tasks)",
+                          tasks);
+            ret = FLB_RETRY;
+        }
+        else {
+            flb_storage_chunk_count(config, &mem_chunks, &fs_chunks);
+            if (mem_chunks + fs_chunks > 0) {
+                flb_plg_error(ctx->ins,
+                              "single-chunk session is incomplete (%d pending chunks)",
+                              mem_chunks + fs_chunks);
+                ret = FLB_RETRY;
+            }
+            else if (fseeko(ctx->spool, 0, SEEK_END) != 0 ||
+                     (spool_size = ftello(ctx->spool)) < 0) {
+                ret = FLB_RETRY;
+            }
+            else if (spool_size > 0) {
+                ret = send_spool(ctx);
+            }
+            else {
+                ret = FLB_OK;
+            }
+        }
+
+        if (ret == FLB_OK && clear_spool(ctx) != 0) {
+            ret = FLB_RETRY;
+        }
+        if (ctx->session_failed == FLB_TRUE || ret == FLB_ERROR) {
+            if (ret == FLB_ERROR && ctx->session_failed == FLB_FALSE) {
+                flb_plg_error(ctx->ins,
+                              "single-chunk upload was rejected permanently");
+                config->exit_status_code = 1;
+            }
+            if (clear_spool(ctx) != 0) {
+                config->exit_status_code = 1;
+            }
+            remove_spool(ctx, "aborted");
+            close_spool(ctx);
+        }
+        else if (ret == FLB_OK) {
+            remove_spool(ctx, "empty");
+            close_spool(ctx);
+        }
+        else {
+            flb_plg_error(ctx->ins,
+                          "single-chunk upload failed; preserving spool '%s'",
+                          ctx->spool_path);
+            config->exit_status_code = 1;
+            close_spool(ctx);
+        }
+    }
+#endif
 
     if (ctx->u != NULL) {
         flb_upstream_destroy(ctx->u);
@@ -839,6 +1783,10 @@ static int cb_manticore_exit(void *data, struct flb_config *config)
     if (ctx->bulk_uri != NULL) {
         flb_sds_destroy(ctx->bulk_uri);
     }
+    if (ctx->commit_path != NULL) {
+        flb_sds_destroy(ctx->commit_path);
+    }
+    flb_free(ctx->session_ids);
     flb_free(ctx);
     return 0;
 }
@@ -858,6 +1806,21 @@ static struct flb_config_map config_map[] = {
      FLB_CONFIG_MAP_STR, "id_key", "id",
      0, FLB_TRUE, offsetof(struct flb_out_manticore, id_key),
      "Required top-level non-zero numeric document ID, removed from doc"
+    },
+    {
+     FLB_CONFIG_MAP_BOOL, "single_chunk", "false",
+     0, FLB_TRUE, offsetof(struct flb_out_manticore, single_chunk),
+     "Stage all flushes locally and publish one bulk_import request on shutdown"
+    },
+    {
+     FLB_CONFIG_MAP_STR, "spool_path", NULL,
+     0, FLB_TRUE, offsetof(struct flb_out_manticore, spool_path),
+     "Durable spool file required by single_chunk"
+    },
+    {
+     FLB_CONFIG_MAP_SIZE, "max_session_ids", "1M",
+     0, FLB_TRUE, offsetof(struct flb_out_manticore, max_session_ids),
+     "Maximum IDs tracked for session-wide duplicate detection"
     },
     {
      FLB_CONFIG_MAP_SIZE, "stream_chunk_size", "64K",

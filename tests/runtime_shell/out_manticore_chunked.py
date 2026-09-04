@@ -245,6 +245,234 @@ def main():
     print("captured {} records in {} HTTP chunks".format(
         len(records), len(chunks)))
 
+    session_result = {}
+    session_listener = socket.socket()
+    session_listener.bind(("127.0.0.1", 0))
+    session_listener.listen(1)
+    session_port = session_listener.getsockname()[1]
+    session_server = threading.Thread(
+        target=capture_request,
+        args=(session_listener, session_result),
+        daemon=True,
+    )
+    session_server.start()
+    session_dir = tempfile.TemporaryDirectory()
+    session_input = os.path.join(session_dir.name, "session-records.json")
+    session_parser = os.path.join(session_dir.name, "parsers.conf")
+    session_spool = os.path.join(session_dir.name, "session.ndjson")
+    with open(session_input, "w") as stream:
+        for document_id in range(1, 30001):
+            stream.write(json.dumps({
+                "id": document_id,
+                "message": "session-test",
+                "payload": "x" * 128,
+            }, separators=(",", ":")) + "\n")
+    with open(session_parser, "w") as stream:
+        stream.write("[PARSER]\n    Name session_json\n    Format json\n")
+    session_command = [
+        fluent_bit,
+        "-f", "0.2",
+        "-R", session_parser,
+        "-i", "tail",
+        "-p", "path={}".format(session_input),
+        "-p", "read_from_head=true",
+        "-p", "exit_on_eof=true",
+        "-p", "parser=session_json",
+        "-o", "manticore",
+        "-p", "host=127.0.0.1",
+        "-p", "port={}".format(session_port),
+        "-p", "table=session_logs",
+        "-p", "workers=1",
+        "-p", "single_chunk=true",
+        "-p", "spool_path={}".format(session_spool),
+        "-p", "stream_chunk_size=64K",
+        "-m", "*",
+    ]
+    session_process = subprocess.run(
+        session_command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        universal_newlines=True,
+        timeout=60,
+    )
+    session_server.join(timeout=5)
+    assert session_process.returncode == 0, session_process.stdout
+    assert not session_server.is_alive()
+    session_records = b"".join(session_result["chunks"]).splitlines()
+    assert len(session_records) == 30000
+    assert session_result["request_line"] == (
+        "POST /bulk?bulk_import=session_logs HTTP/1.1")
+    assert not os.path.exists(session_spool)
+    assert not os.path.exists(session_spool + ".commit")
+    assert "service has stopped (0 pending tasks)" in session_process.stdout
+
+    with open(session_input, "a") as stream:
+        stream.write(json.dumps({
+            "id": 1,
+            "message": "duplicate-late",
+            "payload": "x" * 128,
+        }, separators=(",", ":")) + "\n")
+    rejected_listener = socket.socket()
+    rejected_listener.bind(("127.0.0.1", 0))
+    rejected_listener.listen(1)
+    rejected_listener.settimeout(1)
+    rejected_port = rejected_listener.getsockname()[1]
+    rejected_command = list(session_command)
+    rejected_command[rejected_command.index("port={}".format(session_port))] = (
+        "port={}".format(rejected_port))
+    rejected_session = subprocess.run(
+        rejected_command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        universal_newlines=True,
+        timeout=60,
+    )
+    connected = False
+    try:
+        rejected_connection, _ = rejected_listener.accept()
+        rejected_connection.close()
+        connected = True
+    except socket.timeout:
+        pass
+    rejected_listener.close()
+    assert rejected_session.returncode != 0
+    assert not connected
+    assert "must be unique within a session" in rejected_session.stdout
+    assert "single-chunk session aborted" in rejected_session.stdout
+    assert not os.path.exists(session_spool)
+    assert not os.path.exists(session_spool + ".commit")
+    session_dir.cleanup()
+    print("single_chunk combined 30000 records and aborted a late duplicate")
+
+    recovery_dir = tempfile.TemporaryDirectory()
+    recovery_input = os.path.join(recovery_dir.name, "recovery.json")
+    recovery_empty = os.path.join(recovery_dir.name, "empty.json")
+    recovery_parser = os.path.join(recovery_dir.name, "parsers.conf")
+    recovery_spool = os.path.join(recovery_dir.name, "recovery.ndjson")
+    with open(recovery_input, "w") as stream:
+        stream.write('{"id":70001,"message":"recover-me"}\n')
+    open(recovery_empty, "w").close()
+    with open(recovery_parser, "w") as stream:
+        stream.write("[PARSER]\n    Name recovery_json\n    Format json\n")
+    unavailable = socket.socket()
+    unavailable.bind(("127.0.0.1", 0))
+    recovery_port = unavailable.getsockname()[1]
+    unavailable.close()
+
+    def recovery_command(path):
+        return [
+            fluent_bit,
+            "-f", "0.2",
+            "-R", recovery_parser,
+            "-i", "tail",
+            "-p", "path={}".format(path),
+            "-p", "read_from_head=true",
+            "-p", "exit_on_eof=true",
+            "-p", "parser=recovery_json",
+            "-o", "manticore",
+            "-p", "host=127.0.0.1",
+            "-p", "port={}".format(recovery_port),
+            "-p", "table=recovery_logs",
+            "-p", "workers=1",
+            "-p", "single_chunk=true",
+            "-p", "spool_path={}".format(recovery_spool),
+            "-m", "*",
+        ]
+
+    failed_session = subprocess.run(
+        recovery_command(recovery_input),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        universal_newlines=True,
+        timeout=30,
+    )
+    assert failed_session.returncode != 0
+    assert os.path.getsize(recovery_spool) > 0
+    assert os.path.getsize(recovery_spool + ".commit") > 0
+    assert "preserving spool" in failed_session.stdout
+
+    with open(recovery_spool, "ab") as stream:
+        stream.write(b'{"insert":{"table":"recovery_logs","id":999')
+    with open(recovery_spool + ".commit", "ab") as stream:
+        stream.write(b"000000000000")
+
+    recovery_result = {}
+    recovery_listener = socket.socket()
+    recovery_listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    recovery_listener.bind(("127.0.0.1", recovery_port))
+    recovery_listener.listen(1)
+    recovery_server = threading.Thread(
+        target=capture_request,
+        args=(recovery_listener, recovery_result),
+        daemon=True,
+    )
+    recovery_server.start()
+    recovered_session = subprocess.run(
+        recovery_command(recovery_empty),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        universal_newlines=True,
+        timeout=30,
+    )
+    recovery_server.join(timeout=5)
+    assert recovered_session.returncode == 0, recovered_session.stdout
+    assert not recovery_server.is_alive()
+    recovered_records = b"".join(recovery_result["chunks"]).splitlines()
+    assert len(recovered_records) == 1
+    assert json.loads(recovered_records[0])["insert"]["id"] == 70001
+    assert "replaying pending single-chunk spool" in recovered_session.stdout
+    assert not os.path.exists(recovery_spool)
+    assert not os.path.exists(recovery_spool + ".commit")
+
+    second_failed = subprocess.run(
+        recovery_command(recovery_input),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        universal_newlines=True,
+        timeout=30,
+    )
+    assert second_failed.returncode != 0
+    with open(recovery_spool, "r+b") as stream:
+        data = stream.read()
+        marker = data.index(b"recover-me")
+        stream.seek(marker)
+        stream.write(b"Recover-me")
+    corrupt_session = subprocess.run(
+        recovery_command(recovery_empty),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        universal_newlines=True,
+        timeout=30,
+    )
+    assert corrupt_session.returncode != 0
+    assert "commit journal or spool" in corrupt_session.stdout
+    assert "is corrupt" in corrupt_session.stdout
+    os.remove(recovery_spool)
+    os.remove(recovery_spool + ".commit")
+
+    third_failed = subprocess.run(
+        recovery_command(recovery_input),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        universal_newlines=True,
+        timeout=30,
+    )
+    assert third_failed.returncode != 0
+    mismatched_command = recovery_command(recovery_empty)
+    table_index = mismatched_command.index("table=recovery_logs")
+    mismatched_command[table_index] = "table=other_logs"
+    mismatched_session = subprocess.run(
+        mismatched_command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        universal_newlines=True,
+        timeout=30,
+    )
+    assert mismatched_session.returncode != 0
+    assert "does not match this output configuration" in mismatched_session.stdout
+    recovery_dir.cleanup()
+    print("recovery discarded torn tails and rejected corruption/config drift")
+
     rejected_records = [
         ({"id": {"invalid": True}, "message": "poison"}, None,
          "must be a unique, non-zero numeric ID"),
@@ -375,6 +603,42 @@ def main():
     assert invalid_action_process.returncode != 0
     assert "action must be 'insert' or 'create'" in invalid_action_process.stdout
     print("replace action rejected before delivery")
+
+    single_invalid_dir = tempfile.TemporaryDirectory(
+        prefix="manticore-single-config-")
+    single_invalid_spool = os.path.join(single_invalid_dir.name, "spool.ndjson")
+    for extra, expected in [
+        (["-p", "workers=2"],
+         "single_chunk requires exactly one output worker"),
+        (["-p", "action=create"],
+         "single_chunk requires action 'insert' for replay safety"),
+        (["-p", "max_session_ids=0"],
+         "stream_chunk_size and max_session_ids must be greater than zero"),
+    ]:
+        command = [
+            fluent_bit,
+            "-f", "0.2",
+            "-i", "dummy",
+            "-p", "samples=1",
+            "-o", "manticore",
+            "-p", "host=127.0.0.1",
+            "-p", "port=9",
+            "-p", "table=wire_logs",
+            "-p", "workers=1",
+            "-p", "single_chunk=true",
+            "-p", "spool_path={}".format(single_invalid_spool),
+        ] + extra + ["-m", "*"]
+        process = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            universal_newlines=True,
+            timeout=15,
+        )
+        assert process.returncode != 0
+        assert expected in process.stdout
+    single_invalid_dir.cleanup()
+    print("invalid single_chunk worker/action/limit configurations rejected")
 
 
 if __name__ == "__main__":

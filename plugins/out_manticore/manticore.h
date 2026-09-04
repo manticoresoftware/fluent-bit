@@ -22,6 +22,9 @@
 
 #include <fluent-bit/flb_sds.h>
 
+#include <stdint.h>
+#include <stdio.h>
+
 #define FLB_MANTICORE_DEFAULT_PORT 9308
 #define FLB_MANTICORE_BULK_URI     "/bulk?bulk_import="
 
@@ -32,6 +35,18 @@ struct flb_out_manticore {
     char *id_key;
     char *http_user;
     char *http_passwd;
+    int single_chunk;
+    int session_failed;
+    char *spool_path;
+    flb_sds_t commit_path;
+    FILE *spool;
+    int spool_fd;
+    FILE *commit;
+    int commit_fd;
+    uint64_t *session_ids;
+    size_t session_id_count;
+    size_t session_id_capacity;
+    size_t max_session_ids;
     flb_sds_t table_json;
     flb_sds_t bulk_uri;
     size_t stream_chunk_size;

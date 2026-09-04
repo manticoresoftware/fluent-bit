@@ -21,10 +21,11 @@ The target table must exist before Fluent Bit sends data. Manticore's native
 
 Each request is imported directly into one disk chunk and published at request
 EOF. The `table` option is sent both in `bulk_import=<table>` and in every
-operation. Empty NDJSON lines are never generated, so one Fluent Bit flush is
-published as one batch. The plugin closes the HTTP connection after each flush
-to release Manticore's bulk import reservation and unblock ordinary writes.
-For this reason, `net.keepalive` is disabled for this output.
+operation. Empty NDJSON lines are never generated. In the default mode, every
+Fluent Bit flush is one request and therefore one disk chunk. The plugin closes
+the HTTP connection after each request to release Manticore's bulk import
+reservation and unblock ordinary writes. For this reason, `net.keepalive` is
+disabled for this output.
 
 Every record must contain a stable, non-zero numeric ID in `id_key`. Decimal
 strings are accepted and normalized to JSON numbers. Missing, zero, negative,
@@ -46,6 +47,63 @@ verify uniqueness; it does not buffer the encoded NDJSON body.
     Stream_Chunk_Size  64K
 ```
 
+### One chunk for a finite import
+
+Fluent Bit normally splits a large input into several internal chunks. To
+publish all of them as one Manticore disk chunk, enable `single_chunk` and use a
+dedicated durable spool path:
+
+```ini
+[INPUT]
+    Name          tail
+    Path          /data/import.ndjson
+    Read_From_Head On
+    Exit_On_Eof   On
+    Parser        json
+
+[OUTPUT]
+    Name          manticore
+    Match         *
+    Host          manticore
+    Port          9308
+    Table         logs
+    Action        insert
+    Workers       1
+    Single_Chunk  On
+    Spool_Path    /var/lib/fluent-bit/manticore-logs.ndjson
+```
+
+In this mode, `FLB_OK` means that the callback is durably staged locally; it
+does not mean Manticore has published it yet. Flush callbacks serialize records
+to the spool, `fsync` the data, and then `fsync` the callback's committed byte
+offset and checksum to a companion `<spool_path>.commit` journal. The journal
+also binds pending data to its original host, port, TLS mode, table, action,
+ID key, and HTTP user. On recovery, configuration drift or committed-data
+corruption stops startup without a network request; incomplete data or journal
+tails are truncated to the last complete, checksummed commit record. When
+Fluent Bit shuts down after input EOF, the plugin first requires zero running
+tasks and zero pending storage chunks, then streams the
+committed spool in one HTTP request. Both files are removed only after Manticore
+acknowledges the request. A failed final upload exits non-zero and keeps both
+files. The next run replays the committed spool before accepting new input.
+
+Use this mode only for finite imports with an explicit process completion
+boundary such as `Exit_On_Eof On`. A continuously running Fluent Bit process
+does not publish the session until shutdown. `single_chunk` requires `insert`,
+a writable `spool_path` dedicated to one output instance, and one output worker.
+It is not currently supported on Windows. A permanent record error aborts the
+whole session without contacting Manticore and removes the partial spool; rerun
+the finite source after correcting the record.
+
+Session-wide duplicate detection is memory-resident and capped by
+`max_session_ids` (default 1,048,576 IDs). Raise that explicit limit for larger
+imports; the hash table uses up to roughly 16 bytes per allowed ID.
+
+Recovery is at-least-once. If the process loses power after Manticore commits the
+request but before the local commit journal is cleared, the next run can replay
+the same stable IDs. Rows remain correct because `insert` replaces those IDs,
+but the replay can create one additional Manticore disk chunk.
+
 TLS uses the standard Fluent Bit output options:
 
 ```ini
@@ -60,6 +118,9 @@ HTTP Basic authentication is available through `HTTP_User` and `HTTP_Passwd`.
 | `table` | Existing target Manticore table. Required. | none |
 | `action` | Direct-to-disk `/bulk` action: `insert` or `create`. | `insert` |
 | `id_key` | Required top-level non-zero numeric ID, moved to `id` and removed from `doc`. | `id` |
+| `single_chunk` | Stage all Fluent Bit flushes and publish one request at shutdown. | `false` |
+| `spool_path` | Exclusive durable spool file required when `single_chunk` is enabled. | none |
+| `max_session_ids` | Maximum IDs retained for session-wide duplicate detection. | `1M` |
 | `stream_chunk_size` | Maximum NDJSON bytes buffered before an HTTP chunk is written. A single larger record is sent separately. | `64K` |
 | `buffer_size` | Maximum buffer used to read the Manticore response. | `64K` |
 | `http_user` | HTTP Basic authentication user. | none |
