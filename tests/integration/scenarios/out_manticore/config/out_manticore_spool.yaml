@@ -1,0 +1,26 @@
+service:
+  flush: 0.1
+  grace: 3
+  log_level: info
+  http_server: on
+  http_port: ${FLUENT_BIT_HTTP_MONITORING_PORT}
+  parsers_file: ${MANTICORE_PARSERS_FILE}
+
+pipeline:
+  inputs:
+    - name: tail
+      tag: manticore_spool
+      path: ${MANTICORE_INPUT_PATH}
+      read_from_head: true
+      exit_on_eof: ${MANTICORE_EXIT_ON_EOF}
+      parser: spool_json
+
+  outputs:
+    - name: manticore
+      match: '*'
+      host: 127.0.0.1
+      port: ${MANTICORE_PORT}
+      table: spool_logs
+      workers: 1
+      single_chunk: true
+      spool_path: ${MANTICORE_SPOOL_PATH}
